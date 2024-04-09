@@ -12,8 +12,10 @@ import (
 	orderedmap "github.com/wk8/go-ordered-map/v2"
 )
 
+// historyLimit is the maximum number of blocks to keep in history
 const historyLimit = 1024
 
+// TotalSupply represents the total supply data
 type TotalSupply struct {
 	BlockNumber uint64      `json:"blockNumber"` // Block number of the current state
 	Hash        common.Hash `json:"hash"`        // Hash of the current state
@@ -31,6 +33,7 @@ type State struct {
 
 	sync.RWMutex
 
+	canonicalChain         map[uint64]common.Hash
 	HashHistory *orderedmap.OrderedMap[uint64, map[common.Hash]supplyInfo] `json:"-"`
 }
 
@@ -48,13 +51,14 @@ func NewState() *State {
 	state.TotalWithdrawals = big.NewInt(0)
 	state.TotalBurn = big.NewInt(0)
 
+	state.canonicalChain = make(map[uint64]common.Hash)
 	state.HashHistory = orderedmap.New[uint64, map[common.Hash]supplyInfo](historyLimit)
 
 	return state
 }
 
 // setHead sets the current block as the state head
-func (s *State) setHead(supply supplyInfo) {
+func (s *State) setHead(supply *supplyInfo) {
 	s.Lock()
 	defer s.Unlock()
 
@@ -62,10 +66,12 @@ func (s *State) setHead(supply supplyInfo) {
 	s.BlockNumber = supply.Number
 	s.Hash = supply.Hash
 	s.ParentHash = supply.ParentHash
+
+	s.canonicalChain[supply.Number] = supply.Hash
 }
 
 // add adds the supply data to the state
-func (s *State) add(supply supplyInfo) {
+func (s *State) add(supply *supplyInfo) {
 	s.Lock()
 	defer s.Unlock()
 
@@ -77,7 +83,7 @@ func (s *State) add(supply supplyInfo) {
 }
 
 // sub subtracts the supply data from the state
-func (s *State) sub(supply supplyInfo) {
+func (s *State) sub(supply *supplyInfo) {
 	s.Lock()
 	defer s.Unlock()
 
@@ -102,6 +108,45 @@ func (s *State) addToHistory(entry supplyInfo) {
 	hashes[entry.Hash] = entry
 
 	s.HashHistory.Set(entry.Number, hashes)
+}
+
+// getSupply returns the supply data for the specified block number and hash
+func (s *State) getSupply(hash common.Hash, number uint64) (*supplyInfo, bool) {
+	s.RLock()
+	defer s.RUnlock()
+
+	hashes, exists := s.HashHistory.Get(number)
+	if !exists {
+		return nil, false
+	}
+
+	for hHash, supply := range hashes {
+		if hHash == hash {
+			return &supply, true
+		}
+	}
+
+	return nil, false
+}
+
+// getSupplyByHash returns the supply data for the specified block hash
+func (s *State) getSupplyByHash(hash common.Hash) (*supplyInfo, bool) {
+	s.RLock()
+	defer s.RUnlock()
+
+	// It's slow to loop through all history, but performance is not an issue for this app,
+	// and it's not worth the complexity of maintaining a reverse lookup map.
+
+	for pair := s.HashHistory.Newest(); pair != nil; pair = pair.Prev() {
+		hashes := pair.Value
+		for hHash, supply := range hashes {
+			if hHash == hash {
+				return &supply, true
+			}
+		}
+	}
+
+	return nil, false
 }
 
 // cleanHistory cleans the history to maintain only recent blocks
@@ -130,22 +175,35 @@ func (s *State) handleEntry(supply supplyInfo, errCh chan error) {
 	isInitialBlockHandling := s.BlockNumber == 0 && s.Hash == common.Hash{}
 
 	if !isInitialBlockHandling {
+		// When state is behind, forward to block parent
 		if supply.Number-1 > s.BlockNumber {
-			// Forward to block parent
 			s.forwardTo(supply.Number-1, supply.ParentHash, errCh)
+
+			// When state is ahead or parent is not correct, rewind back
 		} else if supply.Number <= s.BlockNumber || supply.ParentHash != s.Hash {
-			// Rewind back to block parent
-			s.rewindTo(supply.Number-1, supply.ParentHash, errCh)
+
+			// Rewind to parent
+			blockNumberHint := supply.Number - 1
+
+			// If the parent is not correct, then rewind by hash only
+			if supply.ParentHash != s.Hash {
+				blockNumberHint = 0
+			}
+
+			s.rewindTo(supply.ParentHash, blockNumberHint, errCh)
 		}
 
-		if supply.Number != s.BlockNumber+1 || supply.ParentHash != s.Hash {
-			errCh <- fmt.Errorf("skipping block %d entry. ParentHash check failed.\n\tTrace ParentHash:\t%s\n\tCurrent state Hash:\t%s", supply.Number, supply.ParentHash, s.Hash)
+		// TODO: the validation happens after the chain reorgs to prepare the state for the new block.
+		// Do we want to revert the reorg in case the validation fails?
+		if supply.Number-1 != s.BlockNumber || supply.ParentHash != s.Hash {
+			errCh <- fmt.Errorf("skipping block %d entry. ParentHash check failed.\n\tCurrent %d ParentHash:\t%s\n\tParent %d Hash:\t%s", supply.Number, supply.Number, supply.ParentHash, s.BlockNumber, s.Hash)
 			return
 		}
 	}
 
-	s.setHead(supply)
-	s.add(supply)
+	// Update state
+	s.setHead(&supply)
+	s.add(&supply)
 
 	// Prepend current block to history for potential future rewinds.
 	s.addToHistory(supply)
@@ -155,61 +213,87 @@ func (s *State) handleEntry(supply supplyInfo, errCh chan error) {
 }
 
 // rewindTo rewinds the state to the specified block number and hash
-func (s *State) rewindTo(number uint64, hash common.Hash, errCh chan error) {
-	// log.Println("Rewinding \n\tto number", number, "hash", hash, "\n\tfrom number", s.BlockNumber, "hash", s.Hash)
+func (s *State) rewindTo(hash common.Hash, numberHint uint64, errCh chan error) {
+	// log.Println("Rewinding \n\tto number", numberHint, "hash", hash, "\n\tfrom number", s.BlockNumber, "hash", s.Hash)
 
 	fromBlock := s.BlockNumber
 	newestTrace := s.HashHistory.Newest()
 	oldestTrace := s.HashHistory.Oldest()
 
-	// Check if the block to rewind to is in history
-	if newestTrace.Key < number || oldestTrace.Key > number {
-		errCh <- fmt.Errorf("cannot rewind to block %d, it is not in history. History oldest number: %d, newest number: %d", number, oldestTrace.Key, newestTrace.Key)
-		return
+	number := uint64(0)
+
+	// Set number and hash of block to rewind to
+	if numberHint == 0 {
+		lookupSupply, found := s.getSupplyByHash(hash)
+		if !found {
+			errCh <- fmt.Errorf("cannot rewind to block hash %s, it is not in history", hash)
+			return
+		}
+		number = lookupSupply.Number
+
+		// Check if the block to rewind to for a known blockNumber is in history
+	} else {
+		number = numberHint
+
+		// Check if the block to rewind to is in history
+		if newestTrace.Key < number || oldestTrace.Key > number {
+			errCh <- fmt.Errorf("cannot rewind to block %d, it is not in history. History oldest number: %d, newest number: %d", number, oldestTrace.Key, newestTrace.Key)
+			return
+		}
 	}
 
-	var lookupHash common.Hash
+	// After rewinding to set block, forward back to expected head if needed
+	var forwardToNumber uint64
+	var forwardToHash common.Hash
+	defer func() {
+		if forwardToNumber > 0 && forwardToHash != (common.Hash{}) {
+			s.forwardTo(forwardToNumber, forwardToHash, errCh)
+		}
+	}()
 
+	// Check if we need to replace the current head (same number for entry and state) with a different hash
+	if number == s.BlockNumber {
+		// Set block to forward to after rewinding to set block
+		forwardToNumber = number
+		forwardToHash = hash
+
+		// Rewind to parent block
+		number -= 1
+	}
+
+	// Revert the canonical chain
+	var hNumber uint64
 	depth := 0
 
-	for pair := s.HashHistory.Newest(); pair != nil; pair = pair.Prev() {
-		hNumber, hashes := pair.Key, pair.Value
-
-		// History can have newer blocks that the one we need, ignore them
-		if hNumber > s.BlockNumber {
-			continue
+	for hNumber = s.BlockNumber; hNumber >= number; hNumber-- {
+		hHash, found := s.canonicalChain[hNumber]
+		if !found {
+			errCh <- fmt.Errorf("cannot find canonChain hash for block number %d", hNumber)
+			return
 		}
 
-		// We reached the block we're looking for, lookup by hash instead of parent hash
-		if s.BlockNumber == number {
-			lookupHash = hash
-		} else if hNumber == s.BlockNumber {
-			lookupHash = s.Hash
-		} else {
-			lookupHash = s.ParentHash
-		}
-
-		supplyHistory, exists := hashes[lookupHash]
-		if !exists {
-			errCh <- fmt.Errorf("cannot rewind to hash %s for block %d, it is not in history", hash, number)
+		supply, found := s.getSupply(hHash, hNumber)
+		if !found {
+			errCh <- fmt.Errorf("cannot find supply info for block number %d (%s)", hNumber, hHash)
 			return
 		}
 
 		// Set current state to the block we are aiming to rewind to
-		s.setHead(supplyHistory)
+		s.setHead(supply)
 
-		// Rewinded successfully
-		if number >= supplyHistory.Number {
+		// Rewinded successfully, don't reverse last block totals
+		if hNumber == number {
 			break
 		}
 
 		// Reverse totals, skip the block we are rewinding to
-		s.sub(supplyHistory)
+		s.sub(supply)
 
 		depth++
 	}
+
 	if depth > 3 {
-		log.Println("Rewinded successfully to block", number, hash, "from block", fromBlock, "depth", depth)
+		log.Println("Rewinded successfully to block", hNumber, "from block", fromBlock, "depth", depth)
 	}
 }
 
@@ -232,8 +316,7 @@ func (s *State) forwardTo(number uint64, hash common.Hash, errCh chan error) {
 
 	var pair *orderedmap.Pair[uint64, map[common.Hash]supplyInfo]
 
-	// TODO: set length
-	canonicalChain := []supplyInfo{}
+	forwardedChain := []supplyInfo{}
 
 	// Locate the block in history
 	for pair = s.HashHistory.Newest(); pair != nil; pair = pair.Prev() {
@@ -250,32 +333,32 @@ func (s *State) forwardTo(number uint64, hash common.Hash, errCh chan error) {
 			return
 		}
 
-		// We reached the block we're looking for.
-		// Take care that state might be behind the target, needing to rewind further
-		if hNumber < number && lookupHash == supply.Hash && s.BlockNumber >= hNumber {
+		// We reached the block we're looking for
+		// 1. history item is smaller than target block number
+		// 2. history item BlockNumber is smaller than the current state block number
+		if hNumber < number && s.BlockNumber > hNumber {
 			breakLoop = true
 		}
 
 		// Next block lookupHash
 		lookupHash = supply.ParentHash
 
-		canonicalChain = append([]supplyInfo{supply}, canonicalChain...)
-
 		if breakLoop {
 			break
 		}
+
+		forwardedChain = append([]supplyInfo{supply}, forwardedChain...)
 	}
 
-	for _, supply := range canonicalChain {
-		if s.BlockNumber > supply.Number-1 {
-			s.rewindTo(supply.Number-1, supply.ParentHash, errCh)
+	// Forward the state up to block
+	for _, supply := range forwardedChain {
+		if s.BlockNumber >= supply.Number {
+			s.rewindTo(supply.ParentHash, supply.Number-1, errCh)
 		}
 
-		// Set current state to the block
-		s.setHead(supply)
-
-		// Add totals for this block
-		s.add(supply)
+		// Set current state
+		s.setHead(&supply)
+		s.add(&supply)
 	}
 
 	if s.BlockNumber != number {
@@ -283,8 +366,8 @@ func (s *State) forwardTo(number uint64, hash common.Hash, errCh chan error) {
 		return
 	}
 
-	if len(canonicalChain) > 3 {
-		log.Println("Forwarded successfully to block", number, hash, "from block", canonicalChain[0].Number, canonicalChain[0].Hash, "depth", len(canonicalChain))
+	if len(forwardedChain) > 3 {
+		log.Println("Forwarded successfully to block", number, "from block", forwardedChain[0].Number, "depth", len(forwardedChain))
 	}
 }
 

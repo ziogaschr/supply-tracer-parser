@@ -3,6 +3,7 @@ package main
 import (
 	"fmt"
 	"math/big"
+	"strings"
 	"testing"
 
 	"github.com/ethereum/go-ethereum/common"
@@ -18,7 +19,7 @@ func TestSetHead(t *testing.T) {
 
 	supply := supplyInfo{Number: 10, Delta: big1, Reward: big1, Withdrawals: big1, Burn: big1, Hash: common.Hash{10}, ParentHash: common.Hash{9}}
 
-	s.setHead(supply)
+	s.setHead(&supply)
 
 	if s.BlockNumber != 10 || s.Hash.Cmp(common.Hash{10}) != 0 || s.ParentHash.Cmp(common.Hash{9}) != 0 {
 		t.Errorf("setHead failed to update state variables")
@@ -35,7 +36,7 @@ func TestAdd(t *testing.T) {
 
 	supply := supplyInfo{Number: 10, Delta: big1, Reward: big1, Withdrawals: big1, Burn: big1, Hash: common.Hash{10}, ParentHash: common.Hash{9}}
 
-	s.add(supply)
+	s.add(&supply)
 
 	big10 := big.NewInt(10)
 
@@ -60,7 +61,7 @@ func TestSub(t *testing.T) {
 
 	supply := supplyInfo{Number: 10, Delta: big1, Reward: big1, Withdrawals: big1, Burn: big1, Hash: common.Hash{10}, ParentHash: common.Hash{9}}
 
-	s.sub(supply)
+	s.sub(&supply)
 
 	big9 := big.NewInt(9)
 
@@ -158,6 +159,12 @@ func TestRewindTo(t *testing.T) {
 	s.TotalReward = big.NewInt(4)
 	s.TotalBurn = big.NewInt(4)
 	s.TotalWithdrawals = big.NewInt(4)
+	s.canonicalChain = map[uint64]common.Hash{
+		0: {0},
+		1: {1},
+		2: {2},
+		3: {3},
+	}
 	s.HashHistory = orderedmap.New[uint64, map[common.Hash]supplyInfo](historyLimit)
 
 	s.HashHistory.Set(0, map[common.Hash]supplyInfo{
@@ -175,7 +182,7 @@ func TestRewindTo(t *testing.T) {
 
 	errCh := make(chan error, 1)
 
-	s.rewindTo(1, common.Hash{1}, errCh)
+	s.rewindTo(common.Hash{1}, 1, errCh)
 
 	// Verify block info
 	if s.BlockNumber != 1 || s.Hash.Cmp(common.Hash{1}) != 0 || s.ParentHash.Cmp(common.Hash{}) != 0 {
@@ -200,6 +207,66 @@ func TestRewindTo(t *testing.T) {
 	}
 }
 
+func TestRewindToSameNumber(t *testing.T) {
+	s := NewState()
+	s.BlockNumber = 3
+	s.Hash = common.Hash{3}
+	s.ParentHash = common.Hash{2}
+	s.TotalDelta = big.NewInt(4)
+	s.TotalReward = big.NewInt(4)
+	s.TotalBurn = big.NewInt(4)
+	s.TotalWithdrawals = big.NewInt(4)
+	s.canonicalChain = map[uint64]common.Hash{
+		0: {0},
+		1: {1},
+		2: {2},
+		3: {3},
+	}
+	s.HashHistory = orderedmap.New[uint64, map[common.Hash]supplyInfo](historyLimit)
+
+	s.HashHistory.Set(0, map[common.Hash]supplyInfo{
+		common.Hash{0}: {Number: 0, Delta: big1, Reward: big1, Withdrawals: big1, Burn: big1, Hash: common.Hash{0}, ParentHash: common.Hash{}},
+	})
+	s.HashHistory.Set(1, map[common.Hash]supplyInfo{
+		common.Hash{1}: {Number: 1, Delta: big1, Reward: big1, Withdrawals: big1, Burn: big1, Hash: common.Hash{1}, ParentHash: common.Hash{0}},
+	})
+	s.HashHistory.Set(2, map[common.Hash]supplyInfo{
+		common.Hash{2}: {Number: 2, Delta: big1, Reward: big1, Withdrawals: big1, Burn: big1, Hash: common.Hash{2}, ParentHash: common.Hash{1}},
+	})
+
+	big2 := big.NewInt(2)
+	s.HashHistory.Set(3, map[common.Hash]supplyInfo{
+		common.Hash{3}:  {Number: 3, Delta: big1, Reward: big1, Withdrawals: big1, Burn: big1, Hash: common.Hash{3}, ParentHash: common.Hash{2}},
+		common.Hash{31}: {Number: 3, Delta: big2, Reward: big2, Withdrawals: big2, Burn: big2, Hash: common.Hash{31}, ParentHash: common.Hash{2}},
+	})
+
+	errCh := make(chan error, 1)
+
+	s.rewindTo(common.Hash{31}, 3, errCh)
+
+	// Verify block info
+	if s.BlockNumber != 3 || s.Hash.Cmp(common.Hash{31}) != 0 || s.ParentHash.Cmp(common.Hash{2}) != 0 {
+		t.Errorf("rewindTo failed to update block info")
+	}
+
+	big5 := big.NewInt(5)
+
+	// Verify total supply
+	if s.TotalDelta.Cmp(big5) != 0 || s.TotalReward.Cmp(big5) != 0 || s.TotalWithdrawals.Cmp(big5) != 0 || s.TotalBurn.Cmp(big5) != 0 {
+		fmt.Printf("TotalDelta want %s have %s\n", big5, s.TotalDelta)
+		fmt.Printf("TotalReward want %s have %s\n", big5, s.TotalReward)
+		fmt.Printf("TotalWithdrawals want %s have %s\n", big5, s.TotalWithdrawals)
+		fmt.Printf("TotalBurn want %s have %s\n", big5, s.TotalBurn)
+
+		t.Errorf("rewindTo failed to update total supply")
+	}
+
+	if len(errCh) != 0 {
+		err := <-errCh
+		t.Errorf("rewindTo failed to update correctly: %v", err)
+	}
+}
+
 func TestForwardTo(t *testing.T) {
 	s := NewState()
 	s.BlockNumber = 1
@@ -209,22 +276,28 @@ func TestForwardTo(t *testing.T) {
 	s.TotalReward = big.NewInt(2)
 	s.TotalBurn = big.NewInt(2)
 	s.TotalWithdrawals = big.NewInt(2)
+	s.canonicalChain = map[uint64]common.Hash{
+		0: {0},
+		1: {1},
+	}
 	s.HashHistory = orderedmap.New[uint64, map[common.Hash]supplyInfo](historyLimit)
+
+	big2 := big.NewInt(2)
 
 	s.HashHistory.Set(0, map[common.Hash]supplyInfo{
 		common.Hash{0}: {Number: 0, Delta: big1, Reward: big1, Withdrawals: big1, Burn: big1, Hash: common.Hash{0}, ParentHash: common.Hash{}},
 	})
 	s.HashHistory.Set(1, map[common.Hash]supplyInfo{
 		common.Hash{1}:  {Number: 1, Delta: big1, Reward: big1, Withdrawals: big1, Burn: big1, Hash: common.Hash{1}, ParentHash: common.Hash{0}},
-		common.Hash{11}: {Number: 1, Delta: big1, Reward: big1, Withdrawals: big1, Burn: big1, Hash: common.Hash{11}, ParentHash: common.Hash{0}},
+		common.Hash{11}: {Number: 1, Delta: big2, Reward: big2, Withdrawals: big2, Burn: big2, Hash: common.Hash{11}, ParentHash: common.Hash{0}},
 	})
 	s.HashHistory.Set(2, map[common.Hash]supplyInfo{
 		common.Hash{2}:  {Number: 2, Delta: big1, Reward: big1, Withdrawals: big1, Burn: big1, Hash: common.Hash{2}, ParentHash: common.Hash{1}},
-		common.Hash{22}: {Number: 2, Delta: big1, Reward: big1, Withdrawals: big1, Burn: big1, Hash: common.Hash{22}, ParentHash: common.Hash{11}},
+		common.Hash{22}: {Number: 2, Delta: big2, Reward: big2, Withdrawals: big2, Burn: big2, Hash: common.Hash{22}, ParentHash: common.Hash{11}},
 	})
 	s.HashHistory.Set(3, map[common.Hash]supplyInfo{
 		common.Hash{3}:  {Number: 3, Delta: big1, Reward: big1, Withdrawals: big1, Burn: big1, Hash: common.Hash{3}, ParentHash: common.Hash{2}},
-		common.Hash{33}: {Number: 3, Delta: big1, Reward: big1, Withdrawals: big1, Burn: big1, Hash: common.Hash{33}, ParentHash: common.Hash{22}},
+		common.Hash{33}: {Number: 3, Delta: big2, Reward: big2, Withdrawals: big2, Burn: big2, Hash: common.Hash{33}, ParentHash: common.Hash{22}},
 	})
 
 	errCh := make(chan error, 1)
@@ -236,14 +309,14 @@ func TestForwardTo(t *testing.T) {
 		t.Errorf("forwardTo failed to update block info")
 	}
 
-	big4 := big.NewInt(4)
+	big7 := big.NewInt(7)
 
 	// Verify total supply
-	if s.TotalDelta.Cmp(big4) != 0 || s.TotalReward.Cmp(big4) != 0 || s.TotalWithdrawals.Cmp(big4) != 0 || s.TotalBurn.Cmp(big4) != 0 {
-		fmt.Printf("TotalDelta want %s have %s\n", big4, s.TotalDelta)
-		fmt.Printf("TotalReward want %s have %s\n", big4, s.TotalReward)
-		fmt.Printf("TotalWithdrawals want %s have %s\n", big4, s.TotalWithdrawals)
-		fmt.Printf("TotalBurn want %s have %s\n", big4, s.TotalBurn)
+	if s.TotalDelta.Cmp(big7) != 0 || s.TotalReward.Cmp(big7) != 0 || s.TotalWithdrawals.Cmp(big7) != 0 || s.TotalBurn.Cmp(big7) != 0 {
+		fmt.Printf("TotalDelta want %s have %s\n", big7, s.TotalDelta)
+		fmt.Printf("TotalReward want %s have %s\n", big7, s.TotalReward)
+		fmt.Printf("TotalWithdrawals want %s have %s\n", big7, s.TotalWithdrawals)
+		fmt.Printf("TotalBurn want %s have %s\n", big7, s.TotalBurn)
 
 		t.Errorf("forwardTo failed to update total supply")
 	}
@@ -272,12 +345,12 @@ func TestBlockValidations(t *testing.T) {
 	withWrongParent := supplyInfo{Number: 3, Delta: big1, Reward: big1, Withdrawals: big1, Burn: big1, Hash: common.Hash{3}, ParentHash: common.Hash{1}}
 	s.handleEntry(withWrongParent, errCh)
 
-	if s.BlockNumber != 2 || s.Hash.Cmp(common.Hash{2}) != 0 || s.ParentHash.Cmp(common.Hash{1}) != 0 {
-		err := <-errCh
+	err := <-errCh
+	if !strings.HasPrefix(err.Error(), "skipping block 3 entry") {
 		t.Errorf("HandleEntry failed to drop entry because of wrong parent hash: %v", err)
 	}
 
-	// Import next block as it passes validations
+	// Import next block that passes validations
 	withCorrectParent := supplyInfo{Number: 3, Delta: big1, Reward: big1, Withdrawals: big1, Burn: big1, Hash: common.Hash{4}, ParentHash: common.Hash{2}}
 	s.handleEntry(withCorrectParent, errCh)
 
