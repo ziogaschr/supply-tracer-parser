@@ -52,6 +52,14 @@ You can run tests with the following command:
 go test ./...
 ```
 
+## Development
+
+For generating the Marshaling code for `gen_*.go` files, which has been generated with `fjl/gencodec` you have to install it first.
+
+```
+go install github.com/fjl/gencodec@latest
+```
+
 ## Contributing
 
 Contributions are welcome. Please submit a pull request or create an issue to discuss the changes you want to make.
