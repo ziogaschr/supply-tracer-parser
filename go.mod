@@ -1,6 +1,6 @@
 module github.com/ziogaschr/supply-tracer-parser
 
-go 1.22
+go 1.21
 
 require (
 	github.com/ethereum/go-ethereum v1.13.14

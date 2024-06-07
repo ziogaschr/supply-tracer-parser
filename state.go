@@ -9,47 +9,152 @@ import (
 	"sync"
 
 	"github.com/ethereum/go-ethereum/common"
+	"github.com/ethereum/go-ethereum/common/hexutil"
 	orderedmap "github.com/wk8/go-ordered-map/v2"
 )
 
 // historyLimit is the maximum number of blocks to keep in history
 const historyLimit = 1024
 
-// TotalSupply represents the total supply data
-type TotalSupply struct {
+// totalSupply represents the total supply data
+type totalSupply struct {
 	BlockNumber uint64      `json:"blockNumber"` // Block number of the current state
 	Hash        common.Hash `json:"hash"`        // Hash of the current state
 	ParentHash  common.Hash `json:"parentHash"`  // Parent hash of the current state
 
-	TotalDelta       *big.Int `json:"totalDelta"`
-	TotalReward      *big.Int `json:"totalReward"`
-	TotalWithdrawals *big.Int `json:"totalWithdrawals"`
-	TotalBurn        *big.Int `json:"totalBurn"`
+	Delta    *big.Int            `json:"delta"`
+	Issuance *supplyInfoIssuance `json:"issuance,omitempty"`
+	Burn     *supplyInfoBurn     `json:"burn,omitempty"`
+}
+
+func (s totalSupply) MarshalJSON() ([]byte, error) {
+	type Alias totalSupply
+	enc := struct {
+		Alias
+		Delta     *hexutil.Big `json:"delta"`
+		DeltaSign string       `json:"deltaSign"`
+	}{
+		Alias: (Alias)(s),
+	}
+
+	if s.Delta.Sign() < 0 {
+		enc.DeltaSign = "-"
+	} else {
+		enc.DeltaSign = "+"
+	}
+
+	delta := new(big.Int).Set(s.Delta)
+	delta.Abs(delta)
+	enc.Delta = (*hexutil.Big)(delta)
+
+	return json.Marshal(&enc)
+}
+
+func (s *totalSupply) UnmarshalJSON(input []byte) error {
+	type Alias totalSupply
+	dec := struct {
+		*Alias
+		Delta     *hexutil.Big `json:"delta"`
+		DeltaSign string       `json:"deltaSign"`
+	}{
+		Alias: (*Alias)(s),
+	}
+	if err := json.Unmarshal(input, &dec); err != nil {
+		return err
+	}
+
+	if dec.Delta != nil && dec.DeltaSign == "-" {
+		delta := (*big.Int)(dec.Delta)
+		s.Delta = delta.Neg(delta)
+	}
+
+	return nil
 }
 
 // State represents the latest state of the parsed supply data
 type State struct {
-	TotalSupply
+	totalSupply
 
 	sync.RWMutex
 
-	canonicalChain         map[uint64]common.Hash
-	HashHistory *orderedmap.OrderedMap[uint64, map[common.Hash]supplyInfo] `json:"-"`
+	canonicalChain map[uint64]common.Hash
+	HashHistory    *orderedmap.OrderedMap[uint64, map[common.Hash]supplyInfo] `json:"-"`
 }
 
 type PersistedState struct {
-	TotalSupply
+	totalSupply
 	File string `json:"file"`
+}
+
+func (ps PersistedState) MarshalJSON() ([]byte, error) {
+	type Alias PersistedState
+	enc := struct {
+		Alias
+	}{
+		Alias: (Alias)(ps),
+	}
+
+	// the PersistedState struct has an embedded struct of `totalSupply` with a custom MarshalJSON method,
+	// so we need to marshal it separately and then merge the results
+
+	// marshal the embedded struct of `totalSupply`
+	s, err := json.Marshal(&enc)
+	if err != nil {
+		return nil, err
+	}
+
+	// unmarshal the embedded struct of `totalSupply` to a map
+	var data map[string]interface{}
+	if err := json.Unmarshal(s, &data); err != nil {
+		return nil, err
+	}
+	// add the `file` field
+	data["file"] = ps.File
+
+	return json.Marshal(&data)
+}
+
+func (s *PersistedState) UnmarshalJSON(input []byte) error {
+	type Alias PersistedState
+	dec := struct {
+		*Alias
+	}{
+		Alias: (*Alias)(s),
+	}
+
+	// the PersistedState struct has an embedded struct of `totalSupply` with a custom UnmarshalJSON method,
+	// so we need to unmarshal it separately and then merge the results
+	if err := json.Unmarshal(input, &dec); err != nil {
+		return err
+	}
+
+	var data map[string]interface{}
+	err := json.Unmarshal(input, &data)
+	if err != nil {
+		return err
+	}
+	if data["file"] != nil {
+		s.File = data["file"].(string)
+	}
+
+	return nil
 }
 
 type SaveLastParsedFile string
 
 func NewState() *State {
 	state := &State{}
-	state.TotalDelta = big.NewInt(0)
-	state.TotalReward = big.NewInt(0)
-	state.TotalWithdrawals = big.NewInt(0)
-	state.TotalBurn = big.NewInt(0)
+	state.Delta = big.NewInt(0)
+	state.Issuance = &supplyInfoIssuance{
+		GenesisAlloc: big.NewInt(0),
+		Reward:       big.NewInt(0),
+		Withdrawals:  big.NewInt(0),
+	}
+	state.Burn = &supplyInfoBurn{
+		EIP1559: big.NewInt(0),
+		Blob:    big.NewInt(0),
+		Misc:    big.NewInt(0),
+	}
 
 	state.canonicalChain = make(map[uint64]common.Hash)
 	state.HashHistory = orderedmap.New[uint64, map[common.Hash]supplyInfo](historyLimit)
@@ -75,11 +180,15 @@ func (s *State) add(supply *supplyInfo) {
 	s.Lock()
 	defer s.Unlock()
 
-	// Add supply to state
-	s.TotalDelta.Add(s.TotalDelta, supply.Delta)
-	s.TotalReward.Add(s.TotalReward, supply.Reward)
-	s.TotalWithdrawals.Add(s.TotalWithdrawals, supply.Withdrawals)
-	s.TotalBurn.Add(s.TotalBurn, supply.Burn)
+	s.Issuance.GenesisAlloc.Add(s.Issuance.GenesisAlloc, supply.Issuance.GenesisAlloc)
+	s.Issuance.Reward.Add(s.Issuance.Reward, supply.Issuance.Reward)
+	s.Issuance.Withdrawals.Add(s.Issuance.Withdrawals, supply.Issuance.Withdrawals)
+	s.Burn.EIP1559.Add(s.Burn.EIP1559, supply.Burn.EIP1559)
+	s.Burn.Blob.Add(s.Burn.Blob, supply.Burn.Blob)
+	s.Burn.Misc.Add(s.Burn.Misc, supply.Burn.Misc)
+
+	delta := supply.getCalculatedDelta()
+	s.Delta.Add(s.Delta, delta)
 }
 
 // sub subtracts the supply data from the state
@@ -87,11 +196,15 @@ func (s *State) sub(supply *supplyInfo) {
 	s.Lock()
 	defer s.Unlock()
 
-	// Subtract supply from state
-	s.TotalDelta.Sub(s.TotalDelta, supply.Delta)
-	s.TotalReward.Sub(s.TotalReward, supply.Reward)
-	s.TotalWithdrawals.Sub(s.TotalWithdrawals, supply.Withdrawals)
-	s.TotalBurn.Sub(s.TotalBurn, supply.Burn)
+	s.Issuance.GenesisAlloc.Sub(s.Issuance.GenesisAlloc, supply.Issuance.GenesisAlloc)
+	s.Issuance.Reward.Sub(s.Issuance.Reward, supply.Issuance.Reward)
+	s.Issuance.Withdrawals.Sub(s.Issuance.Withdrawals, supply.Issuance.Withdrawals)
+	s.Burn.EIP1559.Sub(s.Burn.EIP1559, supply.Burn.EIP1559)
+	s.Burn.Blob.Sub(s.Burn.Blob, supply.Burn.Blob)
+	s.Burn.Misc.Sub(s.Burn.Misc, supply.Burn.Misc)
+
+	delta := supply.getCalculatedDelta()
+	s.Delta.Sub(s.Delta, delta)
 }
 
 // addToHistory adds the supply data to the history
@@ -375,20 +488,12 @@ func (s *State) forwardTo(number uint64, hash common.Hash, errCh chan error) {
 func (s *State) SaveState(path, lastParsedFilename string) {
 	s.RLock()
 
-	data := PersistedState{}
+	ps := PersistedState{
+		totalSupply: s.totalSupply,
+		File:        lastParsedFilename,
+	}
 
-	data.BlockNumber = s.BlockNumber
-	data.Hash = s.Hash
-	data.ParentHash = s.ParentHash
-
-	data.TotalDelta = s.TotalDelta
-	data.TotalReward = s.TotalReward
-	data.TotalWithdrawals = s.TotalWithdrawals
-	data.TotalBurn = s.TotalBurn
-
-	data.File = lastParsedFilename
-
-	jsonData, err := json.Marshal(data)
+	jsonData, err := json.Marshal(&ps)
 	if err != nil {
 		log.Fatalf("failed to marshal state: %v", err)
 	}
@@ -408,22 +513,14 @@ func (s *State) LoadState(file string) (lastFile string, err error) {
 		return "", fmt.Errorf("state file reading: %v", err)
 	}
 
-	var persistedState PersistedState
-	err = json.Unmarshal(bytes, &persistedState)
+	var ps PersistedState
+	err = json.Unmarshal(bytes, &ps)
 	if err != nil {
 		return "", fmt.Errorf("failed to unmarshal state file: %v", err)
 	}
+	s.totalSupply = ps.totalSupply
 
-	s.BlockNumber = persistedState.BlockNumber
-	s.Hash = persistedState.Hash
-	s.ParentHash = persistedState.ParentHash
+	log.Printf("Loaded state from file '%s'. Last parsed file from logs is '%s'.", file, ps.File)
 
-	s.TotalDelta = persistedState.TotalDelta
-	s.TotalReward = persistedState.TotalReward
-	s.TotalWithdrawals = persistedState.TotalWithdrawals
-	s.TotalBurn = persistedState.TotalBurn
-
-	log.Println("Loaded state from file", file)
-
-	return persistedState.File, nil
+	return ps.File, nil
 }
